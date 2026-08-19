@@ -5,6 +5,9 @@ author:
   - name: Rabbi Tweneboah
   - name: Robert Quainor
   - name: Richmond Addai
+  
+output-file: index.html
+    
 format:
   html:
     toc: true
