@@ -1,0 +1,21 @@
+# R / RStudio
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+
+# Quarto / knitr generated files
+.quarto/
+_freeze/
+*_cache/
+*_files/
+
+# Raw datasets are downloaded separately
+# (the BTC minute file is too large for a normal GitHub repository)
+data/*.csv
+!data/README.md
+
+# OS files
+.DS_Store
+Thumbs.db
+

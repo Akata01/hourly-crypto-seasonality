@@ -1,0 +1,1111 @@
+---
+title: "Hourly Seasonality in Cryptocurrency Markets"
+subtitle: "An Empirical Analysis of Bitcoin and Ethereum"
+author:
+  - name: Rabbi Tweneboah
+  - name: Robert Quainor
+  - name: Richmond Addai
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: true
+    code-tools: true
+    code-summary: "Show code"
+    theme: cosmo
+    embed-resources: true
+    fig-width: 10
+    fig-height: 6
+    df-print: paged
+execute:
+  echo: true
+  warning: false
+  message: false
+editor: source
+---
+
+## Abstract
+
+Cryptocurrency markets trade continuously, making them a useful setting for studying whether returns vary systematically across the 168 hours of a seven-day week. This project examines hourly Bitcoin and Ethereum prices, constructs continuously compounded hourly returns, and tests whether particular hours exhibit positive mean returns or probabilities of positive returns above 50%. The analysis combines one-sided mean and binomial tests with Benjamini-Hochberg false-discovery-rate adjustment and trailing one-year rolling windows. Several hour-specific patterns are statistically significant when assessed individually, but the evidence weakens substantially after accounting for multiple testing. Rolling estimates also indicate that apparent seasonal effects vary through time rather than remaining uniformly persistent.
+
+## Research questions
+
+The analysis addresses four questions:
+
+1. How do average log returns vary across the 168 hours of the week?
+2. During which hours, if any, is the mean log return greater than zero?
+3. During which hours, if any, does the probability of a positive return exceed 50%?
+4. Are these patterns stable when estimated through trailing one-year windows?
+
+
+```{r}
+#| label: setup
+#| include: false
+
+## setup required packages
+
+required_packages <- c("data.table", "lubridate", "ggplot2", "scales", "knitr")
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "Install the following packages before rendering: ",
+    paste(missing_packages, collapse = ", ")
+  )
+}
+
+library(data.table)
+library(lubridate)
+library(ggplot2)
+
+theme_set(theme_minimal(base_size = 12))
+
+
+
+#################
+weekday_levels <- c(
+  "Monday", "Tuesday", "Wednesday", "Thursday",
+  "Friday", "Saturday", "Sunday"
+)
+
+eth_path <- "data/ETH_1H.csv"
+btc_path <- "data/coinbaseUSD_1-min_data.csv"
+
+if (!file.exists(eth_path) || !file.exists(btc_path)) {
+  stop(
+    "Place ETH_1H.csv and coinbaseUSD_1-min_data.csv ",
+    "inside the data/ directory."
+  )
+}
+
+```
+
+# Data and methodology
+
+## Data
+
+The analysis uses two supplied historical price files:
+
+- `ETH_1H.csv`, containing Ethereum prices at an hourly frequency.
+- `coinbaseUSD_1-min_data.csv`, containing Bitcoin prices at a one-minute frequency.
+
+All timestamps are treated as UTC so that the 168 hour-of-week categories refer to a single, consistent weekly clock.
+
+To convert the minute-level Bitcoin data to an hourly frequency, the **last available price within each hour** is used as the hourly close. The quality of this approximation is assessed below before returns are constructed.
+
+
+```{r}
+#| label: data-ethereum 
+#| cache: true
+#| include: false
+
+#Data wrangling
+
+eth_raw <- fread(eth_path, select = c("Date", "Close"))
+
+#convert date to a proper tz and check nonconsecutive gaps
+eth_raw[, Date := as.POSIXct(
+  Date, 
+  format = "%Y-%m-%d %H:%M:%S",
+  tz = "UTC"
+)]
+
+setorder(eth_raw, Date)
+eth_raw[, gaps := as.numeric(
+  difftime(Date, shift(Date), units = "hours")
+)]
+
+eth_gap_rows <- eth_raw[!is.na(gaps) & gaps != 1, .(Date, gaps)]
+
+eth_raw[, asset := "Ethereum"]
+setcolorder(eth_raw, c("asset", "Date", "Close", "gaps"))
+
+
+
+```
+
+
+```{r}
+#| label: data-btc
+#| cache: true
+#| include: false
+
+#Data wrangling
+
+btc_raw <- fread(btc_path, select = c("Date", "Close"))
+# Convert btc to proper tz
+btc_raw[, Date := as.POSIXct(
+  Date,
+  format = "%Y-%m-%d %H:%M:%S",
+  tz = "UTC"
+)]
+setorder(btc_raw, Date)
+# Convert mins to hourly data
+btc_raw[, Hour := floor_date(Date, unit = "hour")]
+
+btc_hr <- btc_raw[, .(
+  Close = last(Close),
+  last_obs = last(Date)
+), by = Hour]
+
+## Assess how close the last available observation is to the end of the hour
+btc_hr[, last_min := minute(last_obs)]
+btc_last50_share <- mean(btc_hr$last_min >= 50, na.rm = TRUE)
+
+## Retain hours whose final observation occurs at minute 50 or later
+btc_hr <- btc_hr[last_min >= 50]
+btc_hr[, c("last_min", "last_obs") := NULL]
+setnames(btc_hr, "Hour", "Date")
+
+setorder(btc_hr, Date)
+btc_hr[, gaps := as.numeric(
+         difftime(Date, shift(Date), units = "hours"
+))]
+
+btc_gap_rows <- btc_hr[!is.na(gaps) & gaps != 1, .(Date, gaps)]
+
+btc_hr[, asset := "Bitcoin"]
+setcolorder(btc_hr, c("asset", "Date", "Close", "gaps"))
+
+```
+
+
+
+
+```{r}
+#| label: data-merge
+#| cache: true
+
+crypto <- rbindlist(
+  list(btc_hr, eth_raw),
+  use.names = TRUE
+)
+
+crypto[, asset := factor(
+  asset,
+  levels = c("Bitcoin", "Ethereum")
+)]
+
+rm(btc_hr, btc_raw, eth_raw)
+
+
+```
+
+
+## Hourly log returns
+
+For asset $i$, the hourly continuously compounded return is
+
+$$
+r_{i,t} = \log\left(\frac{P_{i,t}}{P_{i,t-1}}\right).
+$$
+
+
+- *Note*: A return is retained only when the current and previous observations are exactly one hour apart. This avoids treating a price change across a missing multi-hour interval as though it were a one-hour return.
+
+```{r}
+#| label: return-construction
+
+crypto[
+  ,
+  log_return := log(Close / shift(Close)),
+  by = asset
+]
+
+
+crypto[
+  is.na(gaps) | gaps != 1,
+  log_return := NA_real_
+]
+
+setorder(crypto, Date)
+
+crypto[, weekday_num := wday(Date, week_start = 1)]
+crypto[, weekday := factor(
+  weekday_levels[weekday_num],
+  levels = weekday_levels
+)]
+crypto[, hour := lubridate::hour(Date)]
+crypto[, hour_of_week := (weekday_num - 1L) * 24L + hour]
+crypto[, positive_return := log_return > 0]
+```
+
+## Data Quality and Hourly Price Construction
+
+Before estimating hour-of-week effects, the hourly time index is checked to ensure that missing observations do not create returns measured over intervals longer than one hour.
+
+```{r}
+#| label: tbl-data-quality
+#| tbl-cap: "Hourly time-index diagnostics"
+
+data_quality <- crypto[
+  ,
+  .(
+    observations = .N,
+    duplicate_timestamps = sum(duplicated(Date)),
+    one_hour_links = sum(gaps == 1, na.rm = TRUE),
+    nonconsecutive_links = sum(
+      !is.na(gaps) & gaps != 1
+    ),
+    valid_hourly_returns = sum(is.finite(log_return))
+  ),
+  by = asset
+]
+
+data_quality_display <- copy(data_quality)
+setnames(
+  data_quality_display,
+  c(
+    "asset",
+    "observations",
+    "duplicate_timestamps",
+    "one_hour_links",
+    "nonconsecutive_links",
+    "valid_hourly_returns"
+  ),
+  c(
+    "Asset",
+    "Observations",
+    "Duplicates",
+    "One-hour links",
+    "Nonconsecutive links",
+    "Valid returns"
+  )
+)
+
+knitr::kable(data_quality_display)
+```
+
+The Ethereum data are already recorded hourly and are effectively complete for the purposes of this analysis. Only `r data_quality[asset == "Ethereum", nonconsecutive_links]` nonconsecutive hourly links are observed, representing approximately `r scales::percent(data_quality[asset == "Ethereum", nonconsecutive_links] / (data_quality[asset == "Ethereum", one_hour_links] + data_quality[asset == "Ethereum", nonconsecutive_links]), accuracy = 0.001)` of all observed links. Returns spanning these gaps are excluded so that every retained return represents exactly one hour.
+
+The Bitcoin data are recorded at one-minute frequency and contain substantially more gaps at the minute level. Hourly prices are constructed using the **last available closing price within each hour**. Approximately `r scales::percent(btc_last50_share, accuracy = 0.01)` of observed hours have their final available observation at minute 50 or later; hours whose final observation occurs earlier are excluded. The number of minute observations within an hour is not otherwise used as a filtering criterion because the analysis requires an end-of-hour price rather than the complete intrahour path.
+
+After aggregation and this end-of-hour quality filter, approximately `r scales::percent(data_quality[asset == "Bitcoin", one_hour_links] / (data_quality[asset == "Bitcoin", one_hour_links] + data_quality[asset == "Bitcoin", nonconsecutive_links]), accuracy = 0.01)` of Bitcoin hourly links are consecutive. For both assets, log returns are retained only when adjacent hourly prices are exactly one hour apart.
+
+## Descriptive statistics
+
+```{r}
+#| label: tbl-descriptive
+#| tbl-cap: "Descriptive statistics for the cleaned hourly price series"
+
+descriptive_stats <- crypto[
+  ,
+  .(
+    observations = .N,
+    start = min(Date),
+    end = max(Date),
+    mean_price = mean(Close, na.rm = TRUE),
+    sd_price = sd(Close, na.rm = TRUE),
+    minimum_price = min(Close, na.rm = TRUE),
+    maximum_price = max(Close, na.rm = TRUE),
+    valid_hourly_returns = sum(is.finite(log_return)),
+    nonconsecutive_links = sum(
+      !is.na(gaps) & gaps != 1
+    )
+  ),
+  by = asset
+]
+
+descriptive_display <- copy(descriptive_stats)
+
+descriptive_display[
+  ,
+  `:=`(
+    start = format(start, "%Y-%m-%d %H:%M"),
+    end = format(end, "%Y-%m-%d %H:%M"),
+    mean_price = round(mean_price, 2),
+    sd_price = round(sd_price, 2),
+    minimum_price = round(minimum_price, 2),
+    maximum_price = round(maximum_price, 2)
+  )
+]
+
+knitr::kable(descriptive_display)
+```
+
+The cleaned Ethereum series spans from `r format(min(crypto[asset == "Ethereum", Date]), "%Y-%m-%d")` to `r format(max(crypto[asset == "Ethereum", Date]), "%Y-%m-%d")`, while the Bitcoin series spans from `r format(min(crypto[asset == "Bitcoin", Date]), "%Y-%m-%d")` to `r format(max(crypto[asset == "Bitcoin", Date]), "%Y-%m-%d")`. Because the assets cover different periods, later analyses define the most recent 365-day sample separately for each asset.
+
+## Price evolution
+
+```{r}
+#| label: fig-price-history
+#| fig-cap: "Hourly closing prices of Bitcoin and Ethereum"
+#| fig-height: 7
+
+ggplot(crypto, aes(x = Date, y = Close)) +
+  geom_line(linewidth = 0.25) +
+  facet_wrap(
+    ~ asset,
+    ncol = 1,
+    scales = "free_y"
+  ) +
+  scale_y_continuous(
+    labels = scales::label_number(big.mark = ",")
+  ) +
+  labs(
+    x = NULL,
+    y = "Price (USD)"
+  )
+```
+
+@fig-price-history provides the broad price history in the two samples. The large differences in price levels and sample periods make separate vertical scales more informative than plotting the assets on a common axis.
+
+## Return evolution
+
+```{r}
+#| label: fig-return-history
+#| fig-cap: "Hourly log returns of Bitcoin and Ethereum"
+#| fig-height: 7
+
+ggplot(
+  crypto[is.finite(log_return)],
+  aes(x = Date, y = log_return)
+) +
+  geom_hline(
+    yintercept = 0,
+    linewidth = 0.3,
+    linetype = "dashed"
+  ) +
+  geom_line(linewidth = 0.2) +
+  facet_wrap(
+    ~ asset,
+    ncol = 1,
+    scales = "free_y"
+  ) +
+  scale_y_continuous(
+    labels = scales::label_percent(accuracy = 1)
+  ) +
+  labs(
+    x = NULL,
+    y = "Hourly log return"
+  )
+```
+
+@fig-return-history emphasizes that cryptocurrency volatility is not constant through time. This motivates examining whether apparent hour-of-week effects are persistent or instead change across rolling samples.
+
+# Hour-of-week seasonality: most recent 365 days
+
+## Constructing the 168 hourly categories
+
+A cryptocurrency trading week contains $24 \times 7 = 168$ distinct hourly positions. The variable `hour_of_week` is indexed from 0 to 167:
+
+- 0 corresponds to Monday 00:00 UTC;
+- 23 corresponds to Monday 23:00 UTC;
+- 24 corresponds to Tuesday 00:00 UTC;
+- 167 corresponds to Sunday 23:00 UTC.
+
+The most recent 365 days are selected separately for Bitcoin and Ethereum because their samples end on different dates.
+
+```{r}
+#| label: last-365-days
+
+last_365 <- crypto[
+  is.finite(log_return),
+  .SD[
+    Date > max(Date) - days(365) &
+      Date <= max(Date)
+  ],
+  by = asset
+]
+```
+
+## Estimation and hypothesis tests
+
+For each of the 168 hours, two one-sided hypotheses are considered.
+
+For the mean log return,
+
+$$
+H_0: \mu_h \leq 0
+\qquad \text{versus} \qquad
+H_1: \mu_h > 0.
+$$
+
+For the probability of a positive return,
+
+$$
+H_0: p_h \leq 0.50
+\qquad \text{versus} \qquad
+H_1: p_h > 0.50.
+$$
+
+The first hypothesis is evaluated with a one-sample t-test. The second is evaluated with an exact one-sided binomial test.
+
+Each hour is first assessed individually using the one-sided t-test and exact binomial test. Because as many as 168 hour-specific hypotheses are examined for each outcome and asset, a second inferential layer is added using the Benjamini-Hochberg (BH) procedure to control the false discovery rate.
+
+::: {.callout-note title="Interpreting raw and adjusted p-values"}
+Raw p-values measure the evidence for a particular hour when it is considered individually. BH-adjusted p-values address a broader question: whether that evidence remains unusual after accounting for the fact that many hours are examined simultaneously. A low raw p-value can therefore identify a candidate seasonal pattern even when the corresponding adjusted p-value does not support a stronger claim of robust seasonality.
+:::
+
+```{r}
+#| label: test-functions
+
+hour_test <- function(x) {
+  x <- x[is.finite(x)]
+
+  n <- length(x)
+
+  if (n == 0L) {
+    return(list(
+      n = 0L,
+      mean_log_return = NA_real_,
+      sd_log_return = NA_real_,
+      positive_count = 0L,
+      prop_positive = NA_real_,
+      t_statistic = NA_real_,
+      mean_p_value = NA_real_,
+      positive_p_value = NA_real_
+    ))
+  }
+
+  mean_x <- mean(x)
+  sd_x <- sd(x)
+  positive_count <- sum(x > 0)
+
+  if (n >= 2L && is.finite(sd_x) && sd_x > 0) {
+    t_statistic <- mean_x / (sd_x / sqrt(n))
+    mean_p_value <- pt(
+      t_statistic,
+      df = n - 1L,
+      lower.tail = FALSE
+    )
+  } else {
+    t_statistic <- NA_real_
+    mean_p_value <- NA_real_
+  }
+
+  positive_p_value <- pbinom(
+    positive_count - 1L,
+    size = n,
+    prob = 0.50,
+    lower.tail = FALSE
+  )
+
+  list(
+    n = n,
+    mean_log_return = mean_x,
+    sd_log_return = sd_x,
+    positive_count = positive_count,
+    prop_positive = positive_count / n,
+    t_statistic = t_statistic,
+    mean_p_value = mean_p_value,
+    positive_p_value = positive_p_value
+  )
+}
+```
+
+```{r}
+#| label: static-hourly-results
+
+static_stats <- last_365[
+  ,
+  hour_test(log_return),
+  by = .(
+    asset,
+    weekday_num,
+    weekday,
+    hour,
+    hour_of_week
+  )
+]
+
+static_stats[
+  ,
+  mean_p_fdr := p.adjust(
+    mean_p_value,
+    method = "BH"
+  ),
+  by = asset
+]
+
+static_stats[
+  ,
+  positive_p_fdr := p.adjust(
+    positive_p_value,
+    method = "BH"
+  ),
+  by = asset
+]
+
+static_stats[
+  ,
+  hour_label := sprintf(
+    "%s %02d:00",
+    as.character(weekday),
+    hour
+  )
+]
+
+setorder(static_stats, asset, hour_of_week)
+```
+
+## Significance summary
+
+```{r}
+#| label: tbl-significance-summary
+#| tbl-cap: "Number of hour-of-week tests significant at the 5% level"
+
+significance_summary <- static_stats[
+  ,
+  .(
+    hours_tested = .N,
+    mean_unadjusted = sum(
+      mean_p_value < 0.05,
+      na.rm = TRUE
+    ),
+    mean_BH_FDR = sum(
+      mean_p_fdr < 0.05,
+      na.rm = TRUE
+    ),
+    positive_share_unadjusted = sum(
+      positive_p_value < 0.05,
+      na.rm = TRUE
+    ),
+    positive_share_BH_FDR = sum(
+      positive_p_fdr < 0.05,
+      na.rm = TRUE
+    )
+  ),
+  by = asset
+]
+
+significance_summary_display <- copy(significance_summary)
+setnames(
+  significance_summary_display,
+  c(
+    "asset",
+    "hours_tested",
+    "mean_unadjusted",
+    "mean_BH_FDR",
+    "positive_share_unadjusted",
+    "positive_share_BH_FDR"
+  ),
+  c(
+    "Asset",
+    "Tests",
+    "Mean: raw",
+    "Mean: BH",
+    "Positive share: raw",
+    "Positive share: BH"
+  )
+)
+
+knitr::kable(significance_summary_display)
+```
+
+At the 5% level, the individual tests identify `r static_stats[asset == "Bitcoin", sum(mean_p_value < 0.05, na.rm = TRUE)]` Bitcoin hours and `r static_stats[asset == "Ethereum", sum(mean_p_value < 0.05, na.rm = TRUE)]` Ethereum hours with positive mean returns significant at the conventional threshold. The corresponding counts for the positive-return probability test are `r static_stats[asset == "Bitcoin", sum(positive_p_value < 0.05, na.rm = TRUE)]` and `r static_stats[asset == "Ethereum", sum(positive_p_value < 0.05, na.rm = TRUE)]`. After BH adjustment, the mean-return counts fall to `r static_stats[asset == "Bitcoin", sum(mean_p_fdr < 0.05, na.rm = TRUE)]` for Bitcoin and `r static_stats[asset == "Ethereum", sum(mean_p_fdr < 0.05, na.rm = TRUE)]` for Ethereum, while the adjusted positive-share counts are `r static_stats[asset == "Bitcoin", sum(positive_p_fdr < 0.05, na.rm = TRUE)]` and `r static_stats[asset == "Ethereum", sum(positive_p_fdr < 0.05, na.rm = TRUE)]`. This contrast indicates that several hours appear noteworthy in isolation, but the evidence is substantially weaker once the wider search across the trading week is taken into account.
+
+## Hours with the highest mean returns
+
+```{r}
+#| label: tbl-top-hours
+#| tbl-cap: "Five hours with the highest mean log return in each asset's most recent 365-day sample"
+
+top_hours <- static_stats[
+  order(asset, -mean_log_return),
+  head(.SD, 5L),
+  by = asset
+]
+
+top_hours_display <- top_hours[
+  ,
+  .(
+    Asset = asset,
+    Hour = hour_label,
+    Observations = n,
+    `Mean return` = scales::percent(
+      mean_log_return,
+      accuracy = 0.001
+    ),
+    `Positive share` = scales::percent(
+      prop_positive,
+      accuracy = 0.1
+    ),
+    `Raw p` = round(mean_p_value, 4),
+    `BH p` = round(mean_p_fdr, 4)
+  )
+]
+
+knitr::kable(top_hours_display)
+```
+
+The largest recent point estimate for Bitcoin occurs at `r top_hours[asset == "Bitcoin"][1, hour_label]`, with a mean log return of `r scales::percent(top_hours[asset == "Bitcoin"][1, mean_log_return], accuracy = 0.001)`. For Ethereum, the largest point estimate occurs at `r top_hours[asset == "Ethereum"][1, hour_label]`, with a mean log return of `r scales::percent(top_hours[asset == "Ethereum"][1, mean_log_return], accuracy = 0.001)`. These rankings are descriptive rather than trading recommendations: economically interesting patterns should also be statistically credible, persistent through time, and robust to out-of-sample evaluation and trading frictions.
+
+## Mean-return heatmap
+
+```{r}
+#| label: fig-mean-heatmap
+#| fig-cap: "Mean hourly log return by day and hour, most recent 365 days. Asterisks indicate Benjamini-Hochberg adjusted mean-return p-values below 0.05."
+#| fig-height: 7
+
+ggplot(
+  static_stats,
+  aes(
+    x = hour,
+    y = weekday,
+    fill = mean_log_return
+  )
+) +
+  geom_tile() +
+  geom_point(
+    data = static_stats[mean_p_fdr < 0.05],
+    shape = 8,
+    size = 2
+  ) +
+  facet_wrap(~ asset, ncol = 1) +
+  scale_x_continuous(
+    breaks = seq(0, 23, by = 3),
+    minor_breaks = NULL
+  ) +
+  scale_y_discrete(
+    limits = rev(weekday_levels)
+  ) +
+  scale_fill_gradient2(
+    midpoint = 0,
+    labels = scales::label_percent(
+      accuracy = 0.01
+    ),
+    name = "Mean\nreturn"
+  ) +
+  labs(
+    x = "Hour of day (UTC)",
+    y = NULL
+  )
+```
+
+@fig-mean-heatmap is more interpretable than a single line running from hour 0 to hour 167 because it preserves the calendar structure of the trading week.
+
+## Probability of a positive return
+
+```{r}
+#| label: fig-positive-heatmap
+#| fig-cap: "Share of positive hourly returns by day and hour, most recent 365 days. Asterisks indicate Benjamini-Hochberg adjusted binomial-test p-values below 0.05."
+#| fig-height: 7
+
+ggplot(
+  static_stats,
+  aes(
+    x = hour,
+    y = weekday,
+    fill = prop_positive
+  )
+) +
+  geom_tile() +
+  geom_point(
+    data = static_stats[positive_p_fdr < 0.05],
+    shape = 8,
+    size = 2
+  ) +
+  facet_wrap(~ asset, ncol = 1) +
+  scale_x_continuous(
+    breaks = seq(0, 23, by = 3),
+    minor_breaks = NULL
+  ) +
+  scale_y_discrete(
+    limits = rev(weekday_levels)
+  ) +
+  scale_fill_gradient2(
+    midpoint = 0.50,
+    limits = c(
+      min(0.40, min(static_stats$prop_positive, na.rm = TRUE)),
+      max(0.60, max(static_stats$prop_positive, na.rm = TRUE))
+    ),
+    labels = scales::label_percent(accuracy = 1),
+    name = "Positive\nshare"
+  ) +
+  labs(
+    x = "Hour of day (UTC)",
+    y = NULL
+  )
+```
+
+@fig-positive-heatmap shows whether the same hours that have relatively high average returns also have a high frequency of positive returns. The two measures need not coincide: an hour may have a positive average because of a small number of large gains even when its probability of a positive return is close to one half.
+
+# Rolling one-year analysis
+
+## Motivation
+
+A pattern observed in one 365-day sample may not be stable through time. To examine temporal variation, the analysis is repeated in trailing 365-day windows over each asset's full sample. Within every window, the 168 hour-of-week categories are re-estimated directly from the underlying hourly returns.
+
+The rolling estimates are evaluated at seven-day intervals. This is a natural frequency for an hour-of-week analysis because each specific weekday-hour receives one new observation per week. Each snapshot therefore summarizes the previous 365 days without generating a large number of nearly identical intermediate endpoints. Successive annual windows still overlap substantially, as is inherent to rolling analysis, so the resulting series is interpreted as a descriptive measure of time variation rather than as a sequence of independent observations.
+
+For every rolling window, the analysis recomputes:
+
+- the mean log return for each hour of the week;
+- the proportion of positive returns;
+- the one-sided t-test p-value;
+- the one-sided exact binomial p-value; and
+- Benjamini-Hochberg adjusted p-values across the hour-of-week tests within that snapshot.
+
+A **minimum coverage criterion** of 40 valid observations is imposed for each weekday-hour within a trailing year. A complete annual window contains roughly 52 observations for a given weekday-hour, so the criterion requires approximately 77% of the expected observations. This limits inference from unusually sparse windows while preserving the large majority of the usable sample.
+
+```{r}
+#| label: rolling-functions
+
+rolling_snapshot <- function(
+    asset_data,
+    endpoint,
+    window_days = 365L,
+    min_obs = 40L) {
+
+  asset_name <- unique(asset_data$asset)
+
+  window_start <- endpoint - days(window_days)
+
+  window_data <- asset_data[
+    is.finite(log_return) &
+      Date > window_start &
+      Date <= endpoint
+  ]
+
+  if (nrow(window_data) == 0L) {
+    return(NULL)
+  }
+
+  out <- window_data[
+    ,
+    hour_test(log_return),
+    by = .(
+      weekday_num,
+      weekday,
+      hour,
+      hour_of_week
+    )
+  ]
+
+  out <- out[n >= min_obs]
+
+  if (nrow(out) == 0L) {
+    return(NULL)
+  }
+
+  out[, asset := asset_name]
+  out[, window_end := endpoint]
+
+  out[
+    ,
+    mean_p_fdr := p.adjust(
+      mean_p_value,
+      method = "BH"
+    )
+  ]
+
+  out[
+    ,
+    positive_p_fdr := p.adjust(
+      positive_p_value,
+      method = "BH"
+    )
+  ]
+
+  out[]
+}
+
+
+rolling_analysis <- function(
+    data,
+    window_days = 365L,
+    step_days = 7L,
+    min_obs = 40L) {
+
+  asset_names <- unique(data$asset)
+
+  results <- lapply(
+    asset_names,
+    function(asset_name) {
+
+      asset_data <- data[asset == asset_name]
+      setorder(asset_data, Date)
+
+      first_endpoint <- min(asset_data$Date) +
+        days(window_days)
+
+      last_endpoint <- max(asset_data$Date)
+
+      endpoints <- seq(
+        from = first_endpoint,
+        to = last_endpoint,
+        by = paste(step_days, "days")
+      )
+
+      rbindlist(
+        lapply(
+          endpoints,
+          function(endpoint) {
+            rolling_snapshot(
+              asset_data = asset_data,
+              endpoint = endpoint,
+              window_days = window_days,
+              min_obs = min_obs
+            )
+          }
+        ),
+        use.names = TRUE,
+        fill = TRUE
+      )
+    }
+  )
+
+  rbindlist(
+    results,
+    use.names = TRUE,
+    fill = TRUE
+  )
+}
+```
+
+```{r}
+#| label: rolling-estimation
+#| cache: true
+
+rolling_stats <- rolling_analysis(
+  data = crypto,
+  window_days = 365L,
+  step_days = 7L,
+  min_obs = 40L
+)
+
+rolling_stats[
+  ,
+  hour_label := sprintf(
+    "%s %02d:00",
+    as.character(weekday),
+    hour
+  )
+]
+```
+
+## Rolling mean returns
+
+```{r}
+#| label: fig-rolling-mean
+#| fig-cap: "Trailing 365-day mean log returns by hour of day and weekday"
+#| fig-height: 13
+
+ggplot(
+  rolling_stats,
+  aes(
+    x = window_end,
+    y = hour,
+    fill = mean_log_return
+  )
+) +
+  geom_tile() +
+  facet_grid(
+    weekday ~ asset,
+    scales = "free_x"
+  ) +
+  scale_y_continuous(
+    breaks = c(0, 6, 12, 18, 23),
+    minor_breaks = NULL
+  ) +
+  scale_fill_gradient2(
+    midpoint = 0,
+    labels = scales::label_percent(
+      accuracy = 0.01
+    ),
+    name = "Mean\nreturn"
+  ) +
+  labs(
+    x = "Rolling-window end date",
+    y = "Hour (UTC)"
+  ) +
+  theme(
+    strip.text.y = element_text(angle = 0)
+  )
+```
+
+@fig-rolling-mean makes persistence visible directly. A stable seasonality pattern would appear as a relatively consistent band at the same weekday and hour over successive windows. Frequent sign changes or isolated patches are more consistent with time-varying or sample-specific effects.
+
+## Rolling probability of positive returns
+
+```{r}
+#| label: fig-rolling-positive
+#| fig-cap: "Trailing 365-day proportion of positive returns by hour of day and weekday"
+#| fig-height: 13
+
+ggplot(
+  rolling_stats,
+  aes(
+    x = window_end,
+    y = hour,
+    fill = prop_positive
+  )
+) +
+  geom_tile() +
+  facet_grid(
+    weekday ~ asset,
+    scales = "free_x"
+  ) +
+  scale_y_continuous(
+    breaks = c(0, 6, 12, 18, 23),
+    minor_breaks = NULL
+  ) +
+  scale_fill_gradient2(
+    midpoint = 0.50,
+    labels = scales::label_percent(accuracy = 1),
+    name = "Positive\nshare"
+  ) +
+  labs(
+    x = "Rolling-window end date",
+    y = "Hour (UTC)"
+  ) +
+  theme(
+    strip.text.y = element_text(angle = 0)
+  )
+```
+
+The rolling positive-return heatmap complements the rolling mean analysis. It distinguishes hours that repeatedly produce small positive returns from hours whose average is driven by occasional larger observations.
+
+## Evolution of statistically significant hours
+
+```{r}
+#| label: rolling-significance
+
+rolling_significance <- rolling_stats[
+  ,
+  .(
+    hours_tested = .N,
+    mean_sig_unadjusted = sum(
+      mean_p_value < 0.05,
+      na.rm = TRUE
+    ),
+    mean_sig_fdr = sum(
+      mean_p_fdr < 0.05,
+      na.rm = TRUE
+    ),
+    positive_sig_unadjusted = sum(
+      positive_p_value < 0.05,
+      na.rm = TRUE
+    ),
+    positive_sig_fdr = sum(
+      positive_p_fdr < 0.05,
+      na.rm = TRUE
+    )
+  ),
+  by = .(
+    asset,
+    window_end
+  )
+]
+
+rolling_significance_long <- melt(
+  rolling_significance,
+  id.vars = c(
+    "asset",
+    "window_end",
+    "hours_tested"
+  ),
+  measure.vars = c(
+    "mean_sig_unadjusted",
+    "mean_sig_fdr",
+    "positive_sig_unadjusted",
+    "positive_sig_fdr"
+  ),
+  variable.name = "test",
+  value.name = "significant_hours"
+)
+
+rolling_significance_long[
+  ,
+  test := factor(
+    test,
+    levels = c(
+      "mean_sig_unadjusted",
+      "mean_sig_fdr",
+      "positive_sig_unadjusted",
+      "positive_sig_fdr"
+    ),
+    labels = c(
+      "Mean: unadjusted",
+      "Mean: BH-FDR",
+      "Positive share: unadjusted",
+      "Positive share: BH-FDR"
+    )
+  )
+]
+
+rolling_summary <- rolling_significance[
+  ,
+  .(
+    windows = .N,
+    mean_raw_median = median(mean_sig_unadjusted, na.rm = TRUE),
+    mean_raw_max = max(mean_sig_unadjusted, na.rm = TRUE),
+    mean_BH_max = max(mean_sig_fdr, na.rm = TRUE),
+    positive_raw_median = median(positive_sig_unadjusted, na.rm = TRUE),
+    positive_raw_max = max(positive_sig_unadjusted, na.rm = TRUE),
+    positive_BH_max = max(positive_sig_fdr, na.rm = TRUE)
+  ),
+  by = asset
+]
+```
+
+```{r}
+#| label: fig-rolling-significance
+#| fig-cap: "Number of statistically significant hour-of-week effects in each trailing one-year window"
+#| fig-height: 7
+
+ggplot(
+  rolling_significance_long,
+  aes(
+    x = window_end,
+    y = significant_hours,
+    linetype = test
+  )
+) +
+  geom_line(linewidth = 0.55) +
+  facet_wrap(
+    ~ asset,
+    ncol = 1,
+    scales = "free_x"
+  ) +
+  labs(
+    x = "Rolling-window end date",
+    y = "Number of significant hours",
+    linetype = NULL
+  )
+```
+
+@fig-rolling-significance shows that the number of individually significant hours changes materially across rolling windows, while BH-adjusted discoveries remain much more limited. Across the full rolling sample, the maximum number of BH-adjusted mean-return discoveries in any one-year window is `r rolling_summary[asset == "Bitcoin", mean_BH_max]` for Bitcoin and `r rolling_summary[asset == "Ethereum", mean_BH_max]` for Ethereum. The corresponding maxima for the positive-return probability are `r rolling_summary[asset == "Bitcoin", positive_BH_max]` and `r rolling_summary[asset == "Ethereum", positive_BH_max]`. This difference between raw and adjusted significance reinforces the distinction between candidate hourly patterns and evidence that is robust to multiple comparisons.
+
+# Discussion
+
+The results show clear **descriptive variation** in returns across the 168 hours of the trading week, but substantially weaker evidence that these differences constitute persistent statistical anomalies. In the most recent 365-day samples, `r static_stats[asset == "Bitcoin", sum(mean_p_value < 0.05, na.rm = TRUE)]` Bitcoin hours and `r static_stats[asset == "Ethereum", sum(mean_p_value < 0.05, na.rm = TRUE)]` Ethereum hours have positive mean returns significant at the conventional 5% level when considered individually. However, `r static_stats[asset == "Bitcoin", sum(mean_p_fdr < 0.05, na.rm = TRUE)]` Bitcoin hours and `r static_stats[asset == "Ethereum", sum(mean_p_fdr < 0.05, na.rm = TRUE)]` Ethereum hours remain significant after controlling the false discovery rate. The positive-return probability tests show a similar contrast between individual-hour significance and multiplicity-adjusted evidence.
+
+The magnitude of some point estimates remains economically interesting even when statistical certainty is limited. For example, the strongest recent mean-return hour is `r top_hours[asset == "Bitcoin"][1, hour_label]` for Bitcoin and `r top_hours[asset == "Ethereum"][1, hour_label]` for Ethereum. These estimates identify candidate patterns for further investigation, but the adjusted p-values indicate that they should not be interpreted as established calendar effects solely on the basis of the current sample.
+
+The rolling analysis provides an additional test of persistence. The heatmaps show that the sign and magnitude of hour-of-week effects vary across successive annual windows rather than remaining uniformly stable. Likewise, the number of individually significant hours changes materially through time, whereas BH-adjusted discoveries are much more limited. This suggests that a substantial share of the apparent seasonality is sample-dependent rather than a stable feature of returns.
+
+The analysis is descriptive and inferential rather than causal. It does not test whether observed hourly patterns are generated by regional trading sessions, liquidity conditions, macroeconomic announcements, institutional activity, or other market mechanisms. Such explanations would require additional variables and a different empirical design.
+
+Several limitations remain. First, the study evaluates statistical return patterns rather than an implementable trading strategy and therefore does not incorporate bid-ask spreads, transaction costs, slippage, market depth, or execution latency. Second, the one-sample t-test can be sensitive to heavy-tailed returns and does not explicitly model possible dependence across weekly observations. Third, the analysis remains in-sample. A stronger test of economic usefulness would define a trading rule using a training sample and evaluate it on genuinely unseen data.
+
+# Conclusion
+
+This project investigates intraweek seasonality in Bitcoin and Ethereum using a transparent 168-hour framework. The analysis combines mean log returns, positive-return probabilities, one-sided hypothesis tests, false-discovery-rate adjustment, and trailing one-year estimates of time variation.
+
+The results identify several hourly patterns that appear statistically significant when individual hours are considered in isolation. However, the evidence becomes substantially weaker after accounting for the large number of simultaneous comparisons, and the rolling analysis indicates that many apparent effects vary through time. The findings therefore provide stronger evidence of **time-varying descriptive seasonality** than of a stable and readily exploitable hour-of-week anomaly.
+
+A natural extension would be to test whether candidate hourly patterns retain predictive value out of sample and after realistic trading frictions. Additional robustness work could also use inference procedures designed for heavy-tailed or dependent return data.
+
+# Reproducibility
+
+The report expects the following files inside the `data/` directory:
+
+```text
+data/ETH_1H.csv
+data/coinbaseUSD_1-min_data.csv
+```
+
+The analysis uses UTC throughout.
+
+```{r}
+#| label: session-info
+#| code-fold: true
+
+sessionInfo()
+```
