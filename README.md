@@ -166,7 +166,7 @@ or open the `.qmd` file in RStudio and click **Render**.
 
 This project studies statistical return patterns rather than a fully specified trading strategy. It does not incorporate transaction costs, bid-ask spreads, slippage, market depth, or execution latency. The one-sample t-test can also be sensitive to heavy-tailed return distributions, and the analysis remains in-sample. A natural extension would test candidate patterns on unseen data and evaluate performance after realistic trading frictions.
 
-## Author
+## Authors
 
 **Rabbi Tweneboah, Robert Quainor, and Richmond Addai**
 
