@@ -168,8 +168,6 @@ This project studies statistical return patterns rather than a fully specified t
 
 ## Authors
 
-## Authors
-
 - [Rabbi Tweneboah](https://github.com/Akata01)
 - [Robert Quainor](https://github.com/robertquaid)
 - [Richmond Addai](https://github.com/Rich_addai)
