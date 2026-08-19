@@ -1,5 +1,10 @@
 # Hourly Seasonality in Cryptocurrency Markets
 
+## Full analysis
+
+The complete reproducible analysis is available in
+[`hourly_crypto_seasonality.qmd`](hourly_crypto_seasonality.qmd).
+
 ### An empirical analysis of Bitcoin and Ethereum in R
 
 This project examines whether cryptocurrency returns vary systematically across the **168 hours of a seven-day trading week**. Using hourly Bitcoin and Ethereum prices, it evaluates average log returns, the probability of positive returns, statistical significance across hour-of-week categories, and the stability of these patterns through rolling one-year windows.
