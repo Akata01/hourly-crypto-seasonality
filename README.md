@@ -117,7 +117,7 @@ hourly-crypto-seasonality/
 ### 1. Clone the repository
 
 ```bash
-git clone <YOUR-REPOSITORY-URL>
+git clone https://github.com/Akata01/hourly-crypto-seasonality.git
 cd hourly-crypto-seasonality
 ```
 
